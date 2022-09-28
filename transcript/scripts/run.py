@@ -18,13 +18,17 @@ for i in file_names:
 
     
 
-model = whisper.load_model("small.en")
+model = whisper.load_model("small")
 os.chdir('C:\\Users\\51027\\Documents\\GitHub\\whisper_transcription\\transcript')
+i=1
 for s in audio_files:
-    result = model.transcribe('\\raw_data\\'+s)
-    tmp_file='\\text_data\\'+s[0:-3]+'txt'
+    result = model.transcribe('raw_data\\'+s)
+    tmp_file='text_data\\'+s[0:-4]+'_whisper.txt'
     f = open(tmp_file , 'w' )
     f.write(result['text'])
     f.close()
     
+
+    print('No.'+str(i)+' Aduio:')
     print(result["text"])
+    i=i+1
