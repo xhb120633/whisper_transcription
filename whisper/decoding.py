@@ -78,7 +78,7 @@ class DecodingOptions:
     sample_len: Optional[int] = None  # maximum number of tokens to sample
     best_of: Optional[int] = None     # number of independent samples to collect, when t > 0
     beam_size: Optional[int] = None   # number of beams in beam search, when t == 0
-    patience: float = 0.0             # patience in beam search (https://arxiv.org/abs/2204.05424)
+    patience: Optional[float] = None  # patience in beam search (https://arxiv.org/abs/2204.05424)
 
     # options for ranking generations (either beams or best-of-N samples)
     length_penalty: Optional[float] = None   # "alpha" in Google NMT, None defaults to length norm
@@ -94,7 +94,7 @@ class DecodingOptions:
 
     # timestamp sampling options
     without_timestamps: bool = False              # use <|notimestamps|> to sample text tokens only
-    max_initial_timestamp: Optional[float] = 0.0  # the initial timestamp cannot be later than this
+    max_initial_timestamp: Optional[float] = 1.0  # the initial timestamp cannot be later than this
 
     # implementation details
     fp16: bool = True  # use fp16 for most of the calculation
@@ -252,11 +252,10 @@ class GreedyDecoder(TokenDecoder):
         self.eot = eot
 
     def update(self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor) -> Tuple[Tensor, bool]:
-        temperature = self.temperature
-        if temperature == 0:
+        if self.temperature == 0:
             next_tokens = logits.argmax(dim=-1)
         else:
-            next_tokens = Categorical(logits=logits / temperature).sample()
+            next_tokens = Categorical(logits=logits / self.temperature).sample()
 
         logprobs = F.log_softmax(logits.float(), dim=-1)
         current_logprobs = logprobs[torch.arange(logprobs.shape[0]), next_tokens]
@@ -275,13 +274,15 @@ class GreedyDecoder(TokenDecoder):
 
 
 class BeamSearchDecoder(TokenDecoder):
-    def __init__(self, beam_size: int, eot: int, inference: Inference, patience: float = 0.0):
+    def __init__(self, beam_size: int, eot: int, inference: Inference, patience: Optional[float] = None):
         self.beam_size = beam_size
         self.eot = eot
         self.inference = inference
-        self.patience = patience
-        self.max_candidates: int = round(beam_size * (1.0 + patience))
+        self.patience = patience or 1.0
+        self.max_candidates: int = round(beam_size * self.patience)
         self.finished_sequences = None
+
+        assert self.max_candidates > 0, f"Invalid beam size ({beam_size}) or patience ({patience})"
 
     def reset(self):
         self.finished_sequences = None
@@ -411,7 +412,8 @@ class ApplyTimestampRules(LogitFilter):
 
         # timestamps have to appear in pairs, except directly before EOT; mask logits accordingly
         for k in range(tokens.shape[0]):
-            seq = [t for t in tokens[k, self.sample_begin :].tolist()]
+            sampled_tokens = tokens[k, self.sample_begin :]
+            seq = [t for t in sampled_tokens.tolist()]
             last_was_timestamp = len(seq) >= 1 and seq[-1] >= self.tokenizer.timestamp_begin
             penultimate_was_timestamp = len(seq) < 2 or seq[-2] >= self.tokenizer.timestamp_begin
 
@@ -421,10 +423,19 @@ class ApplyTimestampRules(LogitFilter):
                 else:  # cannot be normal text tokens
                     logits[k, : self.tokenizer.eot] = -np.inf
 
-        # apply the `max_initial_timestamp` option
-        if tokens.shape[1] == self.sample_begin and self.max_initial_timestamp_index is not None:
-            last_allowed = self.tokenizer.timestamp_begin + self.max_initial_timestamp_index
-            logits[:, last_allowed + 1 :] = -np.inf
+            timestamps = sampled_tokens[sampled_tokens.ge(self.tokenizer.timestamp_begin)]
+            if timestamps.numel() > 0:
+                # timestamps shouldn't decrease; forbid timestamp tokens smaller than the last
+                logits[k, self.tokenizer.timestamp_begin : timestamps[-1]] = -np.inf
+
+        if tokens.shape[1] == self.sample_begin:
+            # suppress generating non-timestamp tokens at the beginning
+            logits[:, : self.tokenizer.timestamp_begin] = -np.inf
+
+            # apply the `max_initial_timestamp` option
+            if self.max_initial_timestamp_index is not None:
+                last_allowed = self.tokenizer.timestamp_begin + self.max_initial_timestamp_index
+                logits[:, last_allowed + 1 :] = -np.inf
 
         # if sum of probability over timestamps is above any other token, sample timestamp
         logprobs = F.log_softmax(logits.float(), dim=-1)
@@ -496,8 +507,8 @@ class DecodingTask:
         if options.temperature == 0:
             if options.best_of is not None:
                 raise ValueError("best_of with greedy sampling (T=0) is not compatible")
-        if options.patience != 0.0 and options.beam_size is None:
-            raise ValueError("nonzero patience requires beam_size to be given")
+        if options.patience is not None and options.beam_size is None:
+            raise ValueError("patience requires beam_size to be given")
         if options.length_penalty is not None and not (0 <= options.length_penalty <= 1):
             raise ValueError("length_penalty (alpha) should be a value between 0 and 1")
 
@@ -505,10 +516,8 @@ class DecodingTask:
 
     def _get_initial_tokens(self) -> Tuple[int]:
         tokens = list(self.sot_sequence)
-        prefix = self.options.prefix
-        prompt = self.options.prompt
 
-        if prefix:
+        if prefix := self.options.prefix:
             prefix_tokens = (
                 self.tokenizer.encode(" " + prefix.strip()) if isinstance(prefix, str) else prefix
             )
@@ -517,7 +526,7 @@ class DecodingTask:
                 prefix_tokens = prefix_tokens[-max_prefix_len:]
             tokens = tokens + prefix_tokens
 
-        if prompt:
+        if prompt := self.options.prompt:
             prompt_tokens = (
                 self.tokenizer.encode(" " + prompt.strip()) if isinstance(prompt, str) else prompt
             )
@@ -537,8 +546,7 @@ class DecodingTask:
         elif suppress_tokens is None or len(suppress_tokens) == 0:
             suppress_tokens = []  # interpret empty string as an empty list
         else:
-            assert isinstance(self.options.suppress_tokens, list), "suppress_tokens must be a list"
-            suppress_tokens = self.options.suppress_tokens
+            assert isinstance(suppress_tokens, list), "suppress_tokens must be a list"
 
         suppress_tokens.extend(
             [self.tokenizer.sot, self.tokenizer.sot_prev, self.tokenizer.sot_lm]
@@ -614,7 +622,7 @@ class DecodingTask:
         n_audio: int = mel.shape[0]
 
         audio_features: Tensor = self._get_audio_features(mel)  # encoder forward pass
-        tokens: Tensor = torch.tensor([self.initial_tokens]).expand(n_audio, -1)
+        tokens: Tensor = torch.tensor([self.initial_tokens]).repeat(n_audio, 1)
 
         # detect language if requested, overwriting the language token
         languages, language_probs = self._detect_language(audio_features, tokens)
@@ -693,13 +701,9 @@ def decode(model: "Whisper", mel: Tensor, options: DecodingOptions = DecodingOpt
     result: Union[DecodingResult, List[DecodingResult]]
         The result(s) of decoding contained in `DecodingResult` dataclass instance(s)
     """
-    single = mel.ndim == 2
-    if single:
+    if single := mel.ndim == 2:
         mel = mel.unsqueeze(0)
 
     result = DecodingTask(model, options).run(mel)
-    
-    if single:
-        result = result[0]
 
-    return result
+    return result[0] if single else result
